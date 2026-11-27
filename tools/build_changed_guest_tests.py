@@ -198,6 +198,24 @@ def core_lib_test_targets(source_root, targets, changed_paths=None):
     return sorted(set(guest) | set(host), key=str.casefold)
 
 
+def can_skip_libs(source_root, targets, changed_paths, selected, script_tests=(), changed_wrappers=()):
+    if not changed_paths or not selected or script_tests or changed_wrappers or LIBRARY_LOAD_TEST in selected:
+        return False
+    changed = {Path(path).as_posix() for path in changed_paths}
+    if any(Path(path).parent.as_posix() != "core/libs/tests" or Path(path).suffix != ".cpp" for path in changed):
+        return False
+    owners = defaultdict(set)
+    for target in targets.values():
+        for source in target.get("sources", []):
+            relative = host_only.source_relative_path(source_root, source_root / source["path"])
+            if relative not in changed:
+                continue
+            if source.get("isGenerated") or target.get("type") != "EXECUTABLE" or target["name"] not in selected:
+                return False
+            owners[relative].add(target["name"])
+    return set(owners) == changed and set().union(*owners.values()) == set(selected)
+
+
 def changed_python_wrappers(source_root, changed_paths):
     return {
         (source_root / path).resolve() for path in changed_paths
@@ -279,13 +297,18 @@ def ctest_resolutions(build_dir, targets_by_name, selected=None):
     return resolutions
 
 
-def run(build_dir, selected, targets_by_name, output_log=None, script_tests=(), changed_wrappers=()):
+def run(build_dir, selected, targets_by_name, output_log=None, script_tests=(), changed_wrappers=(), *, build_all_libs=True):
     total = time.perf_counter()
-    started = time.perf_counter()
-    try:
-        build_libs(build_dir)
-    finally:
-        phase_report("build libs", started)
+    if build_all_libs:
+        started = time.perf_counter()
+        try:
+            build_libs(build_dir)
+        finally:
+            phase_report("build libs", started)
+    else:
+        if not selected or script_tests or changed_wrappers or LIBRARY_LOAD_TEST in selected:
+            raise ValueError("target-only build requires selected executable tests")
+        print("[ci-timing] build libs: skipped (experimental test-only target build)", flush=True)
     indices = set()
     if script_tests or changed_wrappers:
         started = time.perf_counter()
@@ -308,6 +331,8 @@ def run(build_dir, selected, targets_by_name, output_log=None, script_tests=(), 
             raise ValueError("no ctest registration resolved for: " + ", ".join(missing))
         indices.update(index for _, index in resolutions.values())
     if not indices:
+        if not build_all_libs:
+            raise ValueError("target-only build resolved no tests")
         print("No core/libs test sources changed; the libs build still ran")
         phase_report("total", total, "0 tests")
         return
@@ -339,6 +364,8 @@ def main(argv=None):
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("changed_paths", nargs="?", type=Path)
     parser.add_argument("--output-log", type=Path)
+    parser.add_argument("--test-only-target-build", action="store_true",
+                        help="experimentally omit the full libs build for directly owned test-only source changes")
     args = parser.parse_args(argv)
     try:
         changed_paths = host_only.read_changed_paths(args.changed_paths) if args.changed_paths else None
@@ -362,7 +389,10 @@ def main(argv=None):
             print("\n".join(selected))
         elif not changed_wrappers:
             print("No core/libs test sources changed")
-        run(args.build_dir, selected, targets_by_name, args.output_log, script_tests, changed_wrappers)
+        skip_libs = args.test_only_target_build and can_skip_libs(
+            source_root, targets, changed_paths, selected, script_tests, changed_wrappers)
+        run(args.build_dir, selected, targets_by_name, args.output_log, script_tests, changed_wrappers,
+            build_all_libs=not skip_libs)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         print(f"{parser.prog}: {error}", file=sys.stderr)
         return 1
