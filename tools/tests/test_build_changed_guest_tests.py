@@ -266,6 +266,45 @@ class Main(unittest.TestCase):
         changed.write_text("\n".join(changed_lines), encoding="utf-8")
         return build_changed_guest_tests.main([str(build), str(changed)])
 
+    def test_test_only_target_build_is_opt_in_and_keeps_test_selection(self):
+        build = self.fixture([self.target("guest_pad_tests", fragment="libc.prx")])
+        changed = Path(self.temporary.name) / "changed.txt"
+        changed.write_text("core/libs/tests/Guest.cpp", encoding="utf-8")
+        results = []
+        for flags in ([], ["--test-only-target-build"]):
+            calls, selections = [], []
+            def execute(cmd, **_):
+                calls.append(cmd)
+                if runs_selected_tests(cmd):
+                    selections.append(Path(cmd[cmd.index("-I") + 1]).read_text())
+                return run_result(self.listing() if "--show-only=json-v1" in cmd else "")
+            with mock.patch.object(build_changed_guest_tests.subprocess, "run", side_effect=execute):
+                self.assertEqual(build_changed_guest_tests.main([str(build), str(changed), *flags]), 0)
+            builds = [cmd[cmd.index("--target") + 1:] for cmd in calls if "--target" in cmd]
+            results.append((builds, selections))
+        self.assertEqual(results, [([["libs"], ["guest_pad_tests"]], ["0,0,0,3\n"]),
+                                   ([["guest_pad_tests"]], ["0,0,0,3\n"])])
+
+    def test_test_only_target_build_falls_back_for_mixed_changes(self):
+        build = self.fixture([self.target("guest_pad_tests", fragment="libc.prx")])
+        changed = Path(self.temporary.name) / "changed.txt"
+        changed.write_text("core/libs/tests/Guest.cpp\ncore/libs/prx/libc/src/FloatBuiltins.cpp", encoding="utf-8")
+        calls = []
+        with mock.patch.object(build_changed_guest_tests.subprocess, "run", side_effect=lambda cmd, **_: calls.append(cmd) or run_result(self.listing() if "--show-only=json-v1" in cmd else "")):
+            self.assertEqual(build_changed_guest_tests.main([str(build), str(changed), "--test-only-target-build"]), 0)
+        self.assertIn(["cmake", "--build", str(build), "--parallel", "3", "--target", "libs"], calls)
+
+    def test_test_only_target_build_propagates_ctest_failure(self):
+        build = self.fixture([self.target("guest_pad_tests", fragment="libc.prx")])
+        changed = Path(self.temporary.name) / "changed.txt"
+        changed.write_text("core/libs/tests/Guest.cpp", encoding="utf-8")
+        def execute(cmd, **_):
+            if runs_selected_tests(cmd):
+                raise subprocess.CalledProcessError(2, cmd)
+            return run_result(self.listing() if "--show-only=json-v1" in cmd else "")
+        with mock.patch.object(build_changed_guest_tests.subprocess, "run", side_effect=execute):
+            self.assertEqual(build_changed_guest_tests.main([str(build), str(changed), "--test-only-target-build"]), 1)
+
     def test_mixed_argument_bearing_and_argumentless_tests_all_run(self):
         build = self.fixture([
             self.target("guest_np_common_tests", source="core/libs/tests/GuestNp.cpp", fragment="libc.prx"),
@@ -829,6 +868,41 @@ class ArtifactOwnerNames(unittest.TestCase):
         aliases = build_changed_guest_tests.target_artifact_names(target)
         self.assertEqual(build_changed_guest_tests.test_owner(["C:/build/tests/guest.check.EXE"], aliases), "guest_target")
         self.assertEqual(build_changed_guest_tests.test_owner(["python", "C:/build/tests/guest.check.EXE"], aliases), "guest_target")
+
+
+class TestOnlyTargetBuildTests(unittest.TestCase):
+    def test_only_directly_owned_test_cpp_sources_are_eligible(self):
+        root = Path("root")
+        source = "core/libs/tests/Guest.cpp"
+        other = "core/libs/tests/Other.cpp"
+        target = {"name": "guest", "type": "EXECUTABLE", "sources": [{"path": source}]}
+        targets = {"guest": target}
+        check = build_changed_guest_tests.can_skip_libs
+        self.assertTrue(check(root, targets, [source], ["guest"]))
+        for changes, selected in ((None, ["guest"]), ([], ["guest"]), ([source], []),
+                                  ([source, other], ["guest"]), ([source, "README.md"], ["guest"]),
+                                  ([source, "core/libs/tests/Guest.hpp"], ["guest"]),
+                                  ([source, "core/libs/prx/libc/src/FloatBuiltins.cpp"], ["guest"]),
+                                  ([source], ["guest", "unrelated"]),
+                                  ([source], ["guest", build_changed_guest_tests.LIBRARY_LOAD_TEST])):
+            with self.subTest(changes=changes, selected=selected):
+                self.assertFalse(check(root, targets, changes, selected))
+        self.assertFalse(check(root, targets, [source], ["guest"], script_tests=["script"]))
+        self.assertFalse(check(root, targets, [source], ["guest"], changed_wrappers=["wrapper"]))
+
+    def test_shared_generated_or_unselected_owner_requires_full_build(self):
+        root = Path("root")
+        source = "core/libs/tests/Guest.cpp"
+        target = {"name": "guest", "type": "EXECUTABLE", "sources": [{"path": source}]}
+        for extra in (
+            {"name": "fixture", "type": "SHARED_LIBRARY", "sources": [{"path": source}]},
+            {"name": "object", "type": "OBJECT_LIBRARY", "sources": [{"path": source}]},
+            {"name": "other", "type": "EXECUTABLE", "sources": [{"path": source}]},
+            {"name": "guest", "type": "EXECUTABLE", "sources": [{"path": source, "isGenerated": True}]},
+        ):
+            with self.subTest(extra=extra):
+                self.assertFalse(build_changed_guest_tests.can_skip_libs(
+                    root, {"guest": target, "extra": extra}, [source], ["guest"]))
 
 
 class ChangeClassification(unittest.TestCase):
