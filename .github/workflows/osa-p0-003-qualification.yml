@@ -1,0 +1,95 @@
+name: OSA P0-003 Windows qualification
+on:
+  push:
+    branches: [qualification/osa-p0-003-windows-ab]
+    paths: [.github/workflows/osa-p0-003-qualification.yml]
+permissions:
+  contents: read
+concurrency:
+  group: osa-p0-003-qualification
+  cancel-in-progress: false
+jobs:
+  benchmark:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      WINLIBS_SHA256: cb2fbad6162540cdf5e1facdce08d4dac359e8cf64f7f696a99274291763b815
+      CCACHE_DISABLE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 73a76ba440cbe9adaad24c191eef0e409c7b5b1b
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Install pinned compiler
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          echo "$WINLIBS_SHA256  $RUNNER_TEMP/winlibs.zip" | sha256sum -c -
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+          echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          exit 1
+      - name: Unit regression and toolchain provenance
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          { git rev-parse HEAD; python --version; gcc --version; g++ --version; cmake --version; ninja --version; } | tee evidence/toolchain.txt
+          python -m unittest tools.tests.test_build_changed_guest_tests -v 2>&1 | tee evidence/unit.log
+      - name: Fetch pinned dependencies
+        run: git submodule update --init --recursive --depth 1 --jobs 4
+      - name: Candidate and baseline on the same runner
+        run: |
+          set -euo pipefail
+          printf '%s\n' core/libs/tests/GuestJxrBitIo.cpp > changed.txt
+          cp changed.txt evidence/changed.txt
+          for arm in candidate baseline; do
+            build="build-$arm"
+            if [ "$arm" = baseline ]; then
+              git show 1bc92752d2350970a2ec8f0ac79e1203c0d25d47:tools/build_changed_guest_tests.py > tools/build_changed_guest_tests.py
+              flags=()
+            else
+              flags=(--test-only-target-build)
+            fi
+            mkdir -p "$build/.cmake/api/v1/query"
+            touch "$build/.cmake/api/v1/query/codemodel-v2"
+            cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DANYPS5_VIDEO_OUT_TEST_DRIVER=windows '-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown' 2>&1 | tee "evidence/$arm-configure.log"
+            python tools/build_changed_guest_tests.py "$build" changed.txt --output-log "evidence/$arm-ctest.log" "${flags[@]}" 2>&1 | tee "evidence/$arm-helper.log"
+            if [ -f "$build/.ninja_log" ]; then cp "$build/.ninja_log" "evidence/$arm-ninja.log"; fi
+            if [ -f "$build/Testing/Temporary/LastTest.log" ]; then cp "$build/Testing/Temporary/LastTest.log" "evidence/$arm-last-test.log"; fi
+            rm -rf -- "$build"
+          done
+      - name: Verify identical nonempty passing CTest selections
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          root = Path("evidence")
+          logs = {arm: (root / f"{arm}-helper.log").read_text(encoding="utf-8", errors="replace") for arm in ("candidate", "baseline")}
+          assert "build libs: skipped (experimental test-only target build)" in logs["candidate"], "candidate did not exercise optimized path"
+          assert "build libs: skipped" not in logs["baseline"]
+          tests = {arm: sorted(re.findall(r"Test\s+#\d+:\s+(\S+)\s+\.+\s+Passed\b", log)) for arm, log in logs.items()}
+          assert tests["candidate"] and tests["candidate"] == tests["baseline"], tests
+          assert "guest_jxr_bitio" in tests["candidate"], tests
+          for arm, log in logs.items():
+              assert "100% tests passed" in log, arm
+              print(arm, tests[arm])
+              for line in log.splitlines():
+                  if "[ci-timing]" in line and "total:" in line:
+                      print(line)
+          PY
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: osa-p0-003-windows-ab
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
